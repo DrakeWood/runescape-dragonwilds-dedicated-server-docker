@@ -48,6 +48,9 @@ MAX_LOG_SIZE="${MAX_LOG_SIZE:-5242880}"             # Rotate the script log once
 LOG_RETENTION="${LOG_RETENTION:-5}"                 # Number of rotated script log generations to keep
 BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-30}"
 PLAYER_CHECK_INTERVAL=5
+# Clients that time out or crash never log a leave line. If the player count has
+# not changed for this long, assume it is stale and treat the server as empty.
+PLAYER_STALE_TIMEOUT="${PLAYER_STALE_TIMEOUT:-14400}"   # 4 hours
 BACKUP_AFTER_UPDATE="${BACKUP_AFTER_UPDATE:-true}"
 BACKUP_DAILY="${BACKUP_DAILY:-true}"
 BACKUP_TIME="${BACKUP_TIME:-3:00 AM}"           # Time-of-day to run daily backup (12-hour format)
@@ -198,6 +201,7 @@ start_server() {
     cd "$SERVERDIR/RSDragonwilds/Binaries/Linux"
     ./RSDragonwildsServer-Linux-Shipping RSDragonwilds -log -Port="${SERVER_PORT}" &
     SERVER_PID=$!
+    SERVER_STARTED=$(date +%s)
     echo "$SERVER_PID" > "$SERVER_PID_FILE"
 }
 
@@ -279,6 +283,7 @@ is_idle() {
     last_activity=$(cat "$LAST_ACTIVITY_FILE" 2>/dev/null || echo "$now")
     idle=$((now - last_activity))
     player_count=$(cat "$PLAYER_COUNT_FILE" 2>/dev/null || echo "0")
+    [ "$idle" -ge "$PLAYER_STALE_TIMEOUT" ] && player_count=0
 
     if [ "$player_count" -eq 0 ] && [ "$idle" -ge "$IDLE_WAIT" ]; then
         return 0
@@ -295,6 +300,7 @@ wait_for_idle() {
         last_activity=$(cat "$LAST_ACTIVITY_FILE" 2>/dev/null || echo "$now")
         idle=$((now - last_activity))
         player_count=$(cat "$PLAYER_COUNT_FILE" 2>/dev/null || echo "0")
+        [ "$idle" -ge "$PLAYER_STALE_TIMEOUT" ] && player_count=0
 
         if [ "$player_count" -eq 0 ] && [ "$idle" -ge "$IDLE_WAIT" ]; then
             log "$label: Server is idle. Proceeding."
@@ -341,8 +347,11 @@ run_update() {
     LOCAL_BUILD="${LOCAL_BUILD:-unknown}"
     log "Local build: $LOCAL_BUILD"
 
-    REMOTE_BUILD=$(/home/ubuntu/steamcmd/steamcmd.sh +login anonymous +app_info_print $APPID +quit \
-        | grep '"buildid"' | head -n1 | sed 's/.*"\([0-9]*\)".*/\1/')
+    # app_info_update 1 forces a fresh fetch; without it steamcmd serves cached
+    # appinfo and never sees new builds. awk reads buildid from the "public"
+    # branch only (the first "buildid" in the dump may belong to another branch).
+    REMOTE_BUILD=$(/home/ubuntu/steamcmd/steamcmd.sh +login anonymous +app_info_update 1 +app_info_print $APPID +quit \
+        | awk '/"public"/{p=1} p && /"buildid"/{gsub(/[^0-9]/,"",$2); print $2; exit}')
     log "Remote build: $REMOTE_BUILD"
 
     if [ -z "$REMOTE_BUILD" ]; then
@@ -480,15 +489,20 @@ monitor_players() {
 
                 if [[ "$line" == *"LogDominionPlayerController: ClientRequestDisconnect"* ]]; then
                     player=$(echo "$line" | grep -oE 'Character Name\[[^]]+\]' | sed 's/Character Name\[//;s/\]//')
-                    if [ -n "$player" ]; then
-                        sed -i "/^${player}$/d" "$PLAYERS_FILE"
-                        local count
-                        count=$(wc -l < "$PLAYERS_FILE")
-                        echo "$count" > "$PLAYER_COUNT_FILE"
-                        date +%s > "$LAST_ACTIVITY_FILE"
-                        log "Player disconnected: $player (online: $count)"
-                        send_discord "🔴 Player disconnected: $player"
+                    # Join and leave lines name a player differently, so an exact
+                    # match often misses. Fall back to dropping the oldest entry
+                    # so every leave line frees exactly one slot.
+                    if [ -n "$player" ] && grep -qxF "$player" "$PLAYERS_FILE"; then
+                        grep -vxF "$player" "$PLAYERS_FILE" > "$PLAYERS_FILE.tmp"; mv "$PLAYERS_FILE.tmp" "$PLAYERS_FILE"
+                    else
+                        sed -i '1d' "$PLAYERS_FILE"
                     fi
+                    local count
+                    count=$(wc -l < "$PLAYERS_FILE")
+                    echo "$count" > "$PLAYER_COUNT_FILE"
+                    date +%s > "$LAST_ACTIVITY_FILE"
+                    log "Player disconnected: ${player:-unknown} (online: $count)"
+                    send_discord "🔴 Player disconnected: ${player:-unknown}"
                 fi
             done < <(tail -n "$NEW_LINES" "$LOG")
             LAST_READ=$TOTAL_LINES
@@ -529,10 +543,13 @@ monitor_players
 if [ "$ENABLE_AUTO_UPDATE" = "true" ]; then
     log "Auto-update enabled — checking every ${UPDATE_TIME}s"
     (
+        # Container restarts (crashes, redeploys) must not push the first check
+        # a full UPDATE_TIME away, or a crash-looping server never updates.
+        sleep "${UPDATE_INITIAL_DELAY:-120}"
         while true; do
-            sleep "$UPDATE_TIME"
             log "=== Running scheduled update check ==="
             run_update
+            sleep "$UPDATE_TIME"
         done
     ) &
     UPDATE_LOOP_PID=$!
@@ -588,6 +605,7 @@ fi
 # stop_server.  We detect that here, wait for the operation to finish, then
 # restart the server — rather than letting the container exit and getting
 # SIGKILL'd mid-steamcmd by the kernel (PID 1 death kills the whole namespace).
+FAST_CRASHES=0
 while true; do
     wait "$SERVER_PID" || true
 
@@ -608,7 +626,23 @@ while true; do
         start_server
         # monitor_players inode watch handles the new log automatically
     else
-        log "Server exited unexpectedly — container stopping"
-        break
+        # Restart in place: exiting the container resets the update/backup
+        # timers and drops idle state. Give up (let docker restart us) only
+        # if it crash-loops.
+        if [ $(( $(date +%s) - SERVER_STARTED )) -lt 120 ]; then
+            FAST_CRASHES=$((FAST_CRASHES + 1))
+        else
+            FAST_CRASHES=0
+        fi
+        if [ "$FAST_CRASHES" -ge 5 ]; then
+            log "Server crash-looping (5 exits within 2 min of start) — container stopping"
+            break
+        fi
+        log "Server exited unexpectedly — restarting in 15s (fast crashes: $FAST_CRASHES)"
+        send_discord "⚠️ Dragonwilds server crashed — restarting."
+        sleep 15
+        : > "$SERVERDIR/.online_players"; echo 0 > "$PLAYER_COUNT_FILE"
+        touch "$SERVER_RESTART_FILE"
+        start_server
     fi
 done

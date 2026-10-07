@@ -5,67 +5,35 @@ on:
     branches:
       - main
     tags:
-      - 'v*'   # triggers on version tags like v0.2.2
+      - 'v*'
   workflow_dispatch:
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags)
-        id: meta
+      - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: andyaltsys/dragonwilds-dedicated-server
+          images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=latest
             type=ref,event=tag
 
-      - name: Build and push
-        uses: docker/build-push-action@v5
+      - uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-
-      - name: Update Docker Hub description
-        # Image is already built and pushed at this point; a Docker Hub
-        # metadata-API hiccup must not fail the whole job.
-        continue-on-error: true
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          DH_SHORT_DESCRIPTION: 'RuneScape: Dragonwilds dedicated server with auto-updates, backups, and Discord alerts'
-        run: |
-          set -euo pipefail
-          # Docker Hub does not allow Personal Access Tokens to edit repository
-          # descriptions ("access to the resource is forbidden with personal access
-          # token"). Requires a PAT with read/write/delete scope and Docker Hub's
-          # documented access-token flow (v2/auth/token + Bearer PATCH).
-          access_token="$(curl -fsS -X POST https://hub.docker.com/v2/auth/token \
-            -H 'Content-Type: application/json' \
-            -d "{\"identifier\":\"${DOCKERHUB_USERNAME}\",\"secret\":\"${DOCKERHUB_TOKEN}\"}" \
-            | jq -er '.access_token')"
-          jq -n --arg short "${DH_SHORT_DESCRIPTION}" --rawfile desc dockerhub.md \
-            '{full_description: $desc, description: $short}' > /tmp/dh-desc.json
-          http_code="$(curl -sS -o /tmp/dh-resp.json -w '%{http_code}' -X PATCH \
-            -H "Authorization: Bearer ${access_token}" \
-            -H 'Content-Type: application/json' \
-            --data-binary @/tmp/dh-desc.json \
-            "https://hub.docker.com/v2/repositories/${DOCKERHUB_USERNAME}/dragonwilds-dedicated-server")"
-          echo "Docker Hub PATCH status: ${http_code}"
-          if [ "${http_code}" != "200" ]; then echo "Docker Hub response:"; cat /tmp/dh-resp.json; exit 22; fi
-          echo "Docker Hub description updated"
