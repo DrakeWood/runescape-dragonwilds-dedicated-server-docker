@@ -504,8 +504,10 @@ monitor_players() {
                     player=$(echo "$line" | sed -nE 's/.*Player Removed from session \[[^]]*\]-\[([^]]*)\].*/\1/p')
                     # Fall back to dropping the oldest entry if the name is
                     # unknown so every leave line frees exactly one slot.
+                    # (grep -v exits 1 when nothing is left; "|| true" keeps set -e from
+                    # killing this monitor when the last player leaves)
                     if [ -n "$player" ] && grep -qxF "$player" "$PLAYERS_FILE"; then
-                        grep -vxF "$player" "$PLAYERS_FILE" > "$PLAYERS_FILE.tmp"; mv "$PLAYERS_FILE.tmp" "$PLAYERS_FILE"
+                        { grep -vxF "$player" "$PLAYERS_FILE" || true; } > "$PLAYERS_FILE.tmp"; mv "$PLAYERS_FILE.tmp" "$PLAYERS_FILE"
                     else
                         sed -i '1d' "$PLAYERS_FILE"
                     fi
