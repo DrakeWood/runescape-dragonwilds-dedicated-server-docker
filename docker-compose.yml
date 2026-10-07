@@ -9,3 +9,4 @@ services:
     volumes:
     - ./server-data:/home/ubuntu/Steam
     restart: unless-stopped
+    stop_grace_period: 130s

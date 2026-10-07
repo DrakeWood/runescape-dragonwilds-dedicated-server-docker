@@ -94,11 +94,12 @@ log() {
 }
 
 # --- FUNCTION TO SEND DISCORD NOTIFICATION ---
+# jq builds the JSON so quotes/backslashes in names can't break the payload;
+# the timeout keeps a slow Discord from stalling the server loops.
 send_discord() {
-    if [ "$ENABLE_DISCORD_NOTIF" = "true" ] && [ -n "$DISCORD_WEBHOOK_URL" ]; then
-        curl -s -X POST -H "Content-Type: application/json" \
-            -d "{\"content\":\"$1\"}" "$DISCORD_WEBHOOK_URL" >/dev/null 2>&1
-    fi
+    [ "$ENABLE_DISCORD_NOTIF" = "true" ] && [ -n "$DISCORD_WEBHOOK_URL" ] || return 0
+    jq -n --arg c "**[${SERVER_NAME:-Dragonwilds}]** $1" '{content: $c}' \
+        | curl -s -m 5 -X POST -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL" >/dev/null 2>&1 || true
 }
 
 # --- INSTALL / VERIFY SERVER FILES VIA STEAMCMD ---
@@ -202,6 +203,9 @@ start_server() {
     ./RSDragonwildsServer-Linux-Shipping RSDragonwilds -log -Port="${SERVER_PORT}" &
     SERVER_PID=$!
     SERVER_STARTED=$(date +%s)
+    local build
+    build=$(grep '"buildid"' "$SERVERDIR/steamapps/appmanifest_$APPID.acf" 2>/dev/null | head -n1 | sed 's/.*"\([0-9]*\)".*/\1/')
+    send_discord "🟢 Server starting on port ${SERVER_PORT} (build ${build:-unknown})"
     echo "$SERVER_PID" > "$SERVER_PID_FILE"
 }
 
@@ -246,8 +250,12 @@ backup_saves() {
     if [ -d "$SAVES_DIR" ]; then
         TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
         BACKUP_SAVE="$BACKUPDIR/SaveGames_$TIMESTAMP"
-        cp -r "$SAVES_DIR" "$BACKUP_SAVE"
-        log "SaveGames backed up to $BACKUP_SAVE"
+        if cp -r "$SAVES_DIR" "$BACKUP_SAVE"; then
+            log "SaveGames backed up to $BACKUP_SAVE ($(du -sh "$BACKUP_SAVE" | cut -f1))"
+        else
+            log "ERROR: SaveGames backup failed"
+            send_discord "❌ Backup FAILED — check disk space on the server volume."
+        fi
     fi
 }
 
@@ -375,6 +383,7 @@ run_update() {
     send_discord "🛠️ Dragonwilds server update detected (build $REMOTE_BUILD) — waiting for idle before updating..."
 
     wait_for_idle "Update"
+    send_discord "⬇️ Server idle — applying update to build $REMOTE_BUILD now."
 
     # Signal the main loop that the server is being stopped intentionally so it
     # waits for us to finish rather than exiting the container (which would
@@ -403,6 +412,7 @@ run_update() {
         log "Recorded applied build: $REMOTE_BUILD"
     else
         log "WARNING: SteamCMD failed after 5 attempts — update may be incomplete"
+        send_discord "❌ Update to build $REMOTE_BUILD FAILED after 5 attempts — restarting on existing files, will retry next check."
     fi
 
     if [ "$BACKUP_AFTER_UPDATE" = "true" ]; then
@@ -512,6 +522,20 @@ monitor_players() {
     done &
 }
 
+# --- GRACEFUL SHUTDOWN ---
+# docker stop sends SIGTERM to this script (PID 1). Without a handler the game
+# never sees it and is SIGKILLed mid-save once Docker's grace period expires.
+shutdown() {
+    trap '' TERM INT
+    log "=== Container stop requested — shutting down server ==="
+    send_discord "🛑 Server shutting down (container stop)."
+    kill $(jobs -p) 2>/dev/null || true
+    stop_server
+    log "=== Shutdown complete ==="
+    exit 0
+}
+trap shutdown TERM INT
+
 # --- MAIN ---
 echo "" >> "$LOGFILE"
 echo "===== Container start $(date '+%Y-%m-%d %H:%M:%S') =====" >> "$LOGFILE"
@@ -607,7 +631,8 @@ fi
 # SIGKILL'd mid-steamcmd by the kernel (PID 1 death kills the whole namespace).
 FAST_CRASHES=0
 while true; do
-    wait "$SERVER_PID" || true
+    EXIT_CODE=0
+    wait "$SERVER_PID" || EXIT_CODE=$?
 
     if [ -f "$UPDATE_IN_PROGRESS_FILE" ] || [ -f "$BACKUP_IN_PROGRESS_FILE" ]; then
         log "Server stopped for scheduled maintenance — waiting for completion..."
@@ -636,10 +661,11 @@ while true; do
         fi
         if [ "$FAST_CRASHES" -ge 5 ]; then
             log "Server crash-looping (5 exits within 2 min of start) — container stopping"
+            send_discord "🚨 Server is crash-looping (5 exits within 2 min of start, last code $EXIT_CODE) — giving up; Docker will restart the container."
             break
         fi
-        log "Server exited unexpectedly — restarting in 15s (fast crashes: $FAST_CRASHES)"
-        send_discord "⚠️ Dragonwilds server crashed — restarting."
+        log "Server exited unexpectedly (code $EXIT_CODE) — restarting in 15s (fast crashes: $FAST_CRASHES)"
+        send_discord "⚠️ Server crashed (exit code $EXIT_CODE$([ "$EXIT_CODE" = 137 ] && echo ', killed — possibly out of memory')) — restarting in 15s."
         sleep 15
         : > "$SERVERDIR/.online_players"; echo 0 > "$PLAYER_COUNT_FILE"
         touch "$SERVER_RESTART_FILE"
