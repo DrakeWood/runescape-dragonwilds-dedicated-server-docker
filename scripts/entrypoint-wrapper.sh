@@ -497,11 +497,13 @@ monitor_players() {
                     fi
                 fi
 
-                if [[ "$line" == *"LogDominionPlayerController: ClientRequestDisconnect"* ]]; then
-                    player=$(echo "$line" | grep -oE 'Character Name\[[^]]+\]' | sed 's/Character Name\[//;s/\]//')
-                    # Join and leave lines name a player differently, so an exact
-                    # match often misses. Fall back to dropping the oldest entry
-                    # so every leave line frees exactly one slot.
+                # "Player Removed from session [<id>]-[<name>]" uses the same name as
+                # the join line (ClientRequestDisconnect only has the character
+                # name) and also fires when a client times out or crashes.
+                if [[ "$line" == *"LogDomMatcherSession: Player Removed from session"* ]]; then
+                    player=$(echo "$line" | sed -nE 's/.*Player Removed from session \[[^]]*\]-\[([^]]*)\].*/\1/p')
+                    # Fall back to dropping the oldest entry if the name is
+                    # unknown so every leave line frees exactly one slot.
                     if [ -n "$player" ] && grep -qxF "$player" "$PLAYERS_FILE"; then
                         grep -vxF "$player" "$PLAYERS_FILE" > "$PLAYERS_FILE.tmp"; mv "$PLAYERS_FILE.tmp" "$PLAYERS_FILE"
                     else
