@@ -347,6 +347,22 @@ run_daily_backup() {
     rm -f "$BACKUP_IN_PROGRESS_FILE"
 }
 
+# --- IS INSTALLED CONTENT CURRENT? ---
+# A new Steam build id does not always mean new files for us: it may only touch
+# a depot we don't install (e.g. the Windows server). Steam then leaves the
+# appmanifest buildid at the old number forever. The depot manifest ids are the
+# real test: if every installed depot manifest is in the remote appinfo ($APPINFO),
+# the files on disk are already the latest.
+content_is_current() {
+    local mf m
+    mf=$(grep '"manifest"' "$SERVERDIR/steamapps/appmanifest_$APPID.acf" 2>/dev/null | grep -oE '[0-9]{10,}' || true)
+    [ -n "$mf" ] || return 1
+    for m in $mf; do
+        echo "$APPINFO" | grep '"gid"' | grep -qF "$m" || return 1
+    done
+    return 0
+}
+
 # --- RUN UPDATE ---
 run_update() {
     log "=== Backing up config ==="
@@ -360,8 +376,8 @@ run_update() {
     # app_info_update 1 forces a fresh fetch; without it steamcmd serves cached
     # appinfo and never sees new builds. awk reads buildid from the "public"
     # branch only (the first "buildid" in the dump may belong to another branch).
-    REMOTE_BUILD=$(/home/ubuntu/steamcmd/steamcmd.sh +login anonymous +app_info_update 1 +app_info_print $APPID +quit \
-        | awk '/"public"/{p=1} p && /"buildid"/{gsub(/[^0-9]/,"",$2); print $2; exit}')
+    APPINFO=$(/home/ubuntu/steamcmd/steamcmd.sh +login anonymous +app_info_update 1 +app_info_print $APPID +quit || true)
+    REMOTE_BUILD=$(echo "$APPINFO" | awk '/"branches"/{b=1} b && /"public"/{p=1} p && /"buildid"/{gsub(/[^0-9]/,"",$2); print $2; exit}')
     log "Remote build: $REMOTE_BUILD"
 
     if [ -z "$REMOTE_BUILD" ]; then
@@ -373,6 +389,11 @@ run_update() {
 
     if [ "$LOCAL_BUILD" = "$REMOTE_BUILD" ]; then
         log "Server is up to date (build $LOCAL_BUILD) — no update needed"
+        return
+    fi
+
+    if content_is_current; then
+        log "Installed depot content already matches remote build $REMOTE_BUILD (build id differs: $LOCAL_BUILD) — no update needed"
         return
     fi
 
@@ -437,7 +458,7 @@ run_update() {
 
     echo "$REMOTE_BUILD $(date +%s)" > "$LAST_ATTEMPT_FILE"
     INSTALLED_BUILD=$(grep '"buildid"' "$SERVERDIR/steamapps/appmanifest_$APPID.acf" 2>/dev/null | head -n1 | sed 's/.*"\([0-9]*\)".*/\1/')
-    if [ "$INSTALLED_BUILD" = "$REMOTE_BUILD" ]; then
+    if [ "$INSTALLED_BUILD" = "$REMOTE_BUILD" ] || content_is_current; then
         send_discord "✅ Dragonwilds server updated to build $REMOTE_BUILD — restarting server."
     else
         log "WARNING: SteamCMD finished but installed build is ${INSTALLED_BUILD:-unknown}, expected $REMOTE_BUILD — will retry after ${UPDATE_RETRY_COOLDOWN}s"
