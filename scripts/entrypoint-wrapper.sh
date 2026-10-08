@@ -34,6 +34,8 @@ SERVER_RESTART_FILE="$SERVERDIR/.server_restart"
 SERVER_PID_FILE="$SERVERDIR/.server_pid"
 LAST_BACKUP_DATE_FILE="$SERVERDIR/.last_backup_date"
 LAST_APPLIED_BUILD_FILE="$SERVERDIR/.last_applied_build"
+LAST_ATTEMPT_FILE="$SERVERDIR/.last_update_attempt"
+UPDATE_RETRY_COOLDOWN="${UPDATE_RETRY_COOLDOWN:-3600}"   # Seconds before retrying the same remote build after an attempt
 UPDATE_IN_PROGRESS_FILE="$SERVERDIR/.update_in_progress"
 BACKUP_IN_PROGRESS_FILE="$SERVERDIR/.backup_in_progress"
 SERVER_PORT="${SERVER_PORT:-7777}"
@@ -379,6 +381,15 @@ run_update() {
         return
     fi
 
+    # If an attempt at this remote build did not result in that build being
+    # installed (e.g. Steam published the build id before the depot content),
+    # do not restart the server again on every check — wait out the cooldown.
+    LAST_ATTEMPT=$(cat "$LAST_ATTEMPT_FILE" 2>/dev/null || echo "")
+    if [ "${LAST_ATTEMPT%% *}" = "$REMOTE_BUILD" ] && [ $(( $(date +%s) - ${LAST_ATTEMPT##* } )) -lt "$UPDATE_RETRY_COOLDOWN" ]; then
+        log "Build $REMOTE_BUILD was attempted recently but local is still $LOCAL_BUILD — retrying after ${UPDATE_RETRY_COOLDOWN}s cooldown"
+        return
+    fi
+
     log "Update available (local: $LOCAL_BUILD → remote: $REMOTE_BUILD) — running SteamCMD"
     send_discord "🛠️ Dragonwilds server update detected (build $REMOTE_BUILD) — waiting for idle before updating..."
 
@@ -398,6 +409,7 @@ run_update() {
         /home/ubuntu/steamcmd/steamcmd.sh \
             +force_install_dir "$SERVERDIR" \
             +login anonymous \
+            +app_info_update 1 \
             +app_update $APPID validate \
             +quit && UPDATE_SUCCEEDED=true && break
         log "SteamCMD failed, retrying in 5 seconds..."
@@ -423,7 +435,14 @@ run_update() {
         log "=== Post-update backup skipped (BACKUP_AFTER_UPDATE=false) ==="
     fi
 
-    send_discord "✅ Dragonwilds server updated to build $REMOTE_BUILD — restarting server."
+    echo "$REMOTE_BUILD $(date +%s)" > "$LAST_ATTEMPT_FILE"
+    INSTALLED_BUILD=$(grep '"buildid"' "$SERVERDIR/steamapps/appmanifest_$APPID.acf" 2>/dev/null | head -n1 | sed 's/.*"\([0-9]*\)".*/\1/')
+    if [ "$INSTALLED_BUILD" = "$REMOTE_BUILD" ]; then
+        send_discord "✅ Dragonwilds server updated to build $REMOTE_BUILD — restarting server."
+    else
+        log "WARNING: SteamCMD finished but installed build is ${INSTALLED_BUILD:-unknown}, expected $REMOTE_BUILD — will retry after ${UPDATE_RETRY_COOLDOWN}s"
+        send_discord "⚠️ SteamCMD finished but the installed build is ${INSTALLED_BUILD:-unknown}, not $REMOTE_BUILD (Steam content may not be ready yet) — restarting on ${INSTALLED_BUILD:-the existing files}; will retry in $((UPDATE_RETRY_COOLDOWN / 60)) min."
+    fi
 
     # Release the main loop to restart the server
     rm -f "$UPDATE_IN_PROGRESS_FILE"
