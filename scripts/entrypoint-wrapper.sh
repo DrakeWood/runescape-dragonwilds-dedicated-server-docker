@@ -566,6 +566,18 @@ monitor_players() {
     done &
 }
 
+# --- CRASH REASON ---
+# Pull the signal and the first game function out of the end of the game log so
+# the crash alert says what happened. Prints nothing when the log has no crash
+# report (e.g. the process was killed from outside).
+crash_reason() {
+    local text exc frame
+    text=$(tail -n 300 "$SERVERDIR/RSDragonwilds/Saved/Logs/RSDragonwilds.log" 2>/dev/null || true)
+    exc=$(printf '%s\n' "$text" | grep -m1 'Unhandled Exception:' | sed -E 's/.*Unhandled Exception: *//')
+    frame=$(printf '%s\n' "$text" | grep -m1 'RSDragonwildsServer-Linux-Shipping!' | sed -E 's/.*Shipping!([^(]*).*/\1/')
+    printf '%s' "${exc}${frame:+ in $frame}"
+}
+
 # --- GRACEFUL SHUTDOWN ---
 # docker stop sends SIGTERM to this script (PID 1). Without a handler the game
 # never sees it and is SIGKILLed mid-save once Docker's grace period expires.
@@ -708,8 +720,10 @@ while true; do
             send_discord "🚨 Server is crash-looping (5 exits within 2 min of start, last code $EXIT_CODE) — giving up; Docker will restart the container."
             break
         fi
-        log "Server exited unexpectedly (code $EXIT_CODE) — restarting in 15s (fast crashes: $FAST_CRASHES)"
-        send_discord "⚠️ Server crashed (exit code $EXIT_CODE$([ "$EXIT_CODE" = 137 ] && echo ', killed — possibly out of memory')) — restarting in 15s."
+        CRASH_REASON=$(crash_reason)
+        CRASH_PLAYERS=$(paste -sd, "$SERVERDIR/.online_players" 2>/dev/null || true)
+        log "Server exited unexpectedly (code $EXIT_CODE)${CRASH_REASON:+: $CRASH_REASON}${CRASH_PLAYERS:+ [online: $CRASH_PLAYERS]} — restarting in 15s (fast crashes: $FAST_CRASHES)"
+        send_discord "⚠️ Server crashed (exit code $EXIT_CODE$([ "$EXIT_CODE" = 137 ] && echo ', killed — possibly out of memory'))${CRASH_REASON:+: $CRASH_REASON}${CRASH_PLAYERS:+ — players online: $CRASH_PLAYERS} — restarting in 15s."
         sleep 15
         : > "$SERVERDIR/.online_players"; echo 0 > "$PLAYER_COUNT_FILE"
         touch "$SERVER_RESTART_FILE"
